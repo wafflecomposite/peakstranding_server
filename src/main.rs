@@ -356,31 +356,57 @@ async fn get_random(
             "limit must be between 1 and 100".into(),
         ));
     }
+
+    // We use a Common Table Expression (CTE) to rank structures.
+    // The ranking is partitioned by user_id and segment to ensure diversity.
+    let base_query = r#"
+        WITH RankedStructures AS (
+            SELECT
+                *,
+                ROW_NUMBER() OVER (PARTITION BY user_id, segment ORDER BY RANDOM()) as diversity_rank
+            FROM structures
+    "#;
+
+    // The final SELECT statement orders by our new diversity rank,
+    // ensuring we get a varied selection first.
+    // We must explicitly list columns because the CTE adds `diversity_rank`,
+    // which is not part of the `Structure` struct.
+    let final_select = r#"
+        )
+        SELECT
+            id, created_at, user_id, username, map_id, scene, segment, prefab,
+            pos_x, pos_y, pos_z, rot_x, rot_y, rot_z, rot_w,
+            rope_start_x, rope_start_y, rope_start_z,
+            rope_end_x, rope_end_y, rope_end_z,
+            rope_length,
+            rope_flying_rotation_x, rope_flying_rotation_y, rope_flying_rotation_z,
+            rope_anchor_rotation_x, rope_anchor_rotation_y, rope_anchor_rotation_z, rope_anchor_rotation_w,
+            antigrav
+        FROM RankedStructures
+        ORDER BY diversity_rank, RANDOM()
+        LIMIT ?;
+    "#;
+
     let rows: Vec<Structure> = if let Some(id) = p.map_id {
-        sqlx::query_as::<_, Structure>(
-            "SELECT * FROM structures \
-             WHERE scene = ? AND map_id = ? \
-             ORDER BY RANDOM() \
-             LIMIT ?;",
-        )
-        .bind(&p.scene)
-        .bind(id)
-        .bind(p.limit)
-        .fetch_all(&state.db)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        let full_query = format!(
+            "{} WHERE scene = ? AND map_id = ? {}",
+            base_query, final_select
+        );
+        sqlx::query_as::<_, Structure>(&full_query)
+            .bind(&p.scene)
+            .bind(id)
+            .bind(p.limit)
+            .fetch_all(&state.db)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     } else {
-        sqlx::query_as::<_, Structure>(
-            "SELECT * FROM structures \
-             WHERE scene = ? \
-             ORDER BY RANDOM() \
-             LIMIT ?;",
-        )
-        .bind(&p.scene)
-        .bind(p.limit)
-        .fetch_all(&state.db)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        let full_query = format!("{} WHERE scene = ? {}", base_query, final_select);
+        sqlx::query_as::<_, Structure>(&full_query)
+            .bind(&p.scene)
+            .bind(p.limit)
+            .fetch_all(&state.db)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     };
 
     Ok(Json(rows))
