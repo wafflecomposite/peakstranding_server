@@ -1,23 +1,110 @@
 use axum::{
-    Json,
-    Router,
-    extract::{Query, State},
-    http::StatusCode,
-    routing::{get, post}, //get,
+    Json, Router,
+    extract::{FromRequestParts, Query, State},
+    http::{HeaderName, StatusCode},
+    routing::{get, post},
 };
+use dashmap::DashMap;
+use dotenvy::dotenv;
+use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, SqlitePool, sqlite::SqlitePoolOptions};
-use tokio::time::Duration;
+use std::env;
+use std::{sync::Arc, time::Duration};
 use tower_http::trace::TraceLayer;
 
-#[derive(Debug, Deserialize, Serialize, FromRow)]
+static STEAM_HEADER: HeaderName = HeaderName::from_static("x-steam-auth"); // Header for Steam auth ticket
+static STEAM_APPID: u64 = 3527290; // Peak Stranding AppID
+const MAX_STRUCTS_PER_SCENE: i64 = 100;
+struct VerifiedUser(u64); // steam_id
+
+#[derive(Clone)]
+struct AppState {
+    db: SqlitePool,
+    cache: Arc<DashMap<String, u64>>,
+    http: Client,
+    steam_key: String,
+}
+
+//#[async_trait] // ???
+impl FromRequestParts<AppState> for VerifiedUser {
+    type Rejection = (StatusCode, String);
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let header = parts
+            .headers
+            .get(&STEAM_HEADER)
+            .ok_or((StatusCode::UNAUTHORIZED, "X-Steam-Auth missing".into()))?
+            .to_str()
+            .map_err(|_| (StatusCode::BAD_REQUEST, "bad header".into()))?
+            .to_owned();
+
+        if let Some(id) = state.cache.get(&header) {
+            return Ok(VerifiedUser(*id));
+        }
+
+        // Not cached – verify with Steam
+        let url = format!(
+            "https://api.steampowered.com/ISteamUserAuth/AuthenticateUserTicket/v1?key={}&appid={}&ticket={}",
+            state.steam_key, STEAM_APPID, header
+        );
+
+        #[derive(Deserialize)]
+        struct SteamResp {
+            response: SteamResponseInner,
+        }
+        #[derive(Deserialize)]
+        struct SteamResponseInner {
+            params: SteamParams,
+        }
+        #[derive(Deserialize)]
+        struct SteamParams {
+            result: String,
+            steamid: String,
+        }
+
+        let res: SteamResp = state
+            .http
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))? // we haven't got a response
+            .json()
+            .await
+            .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?; // we haven't got a _proper_ response
+
+        if res.response.params.result != "OK" {
+            return Err((StatusCode::UNAUTHORIZED, "ticket rejected".into())); // ticket is trash
+        }
+
+        let id = res
+            .response
+            .params
+            .steamid
+            .parse::<u64>()
+            .map_err(|_| (StatusCode::BAD_GATEWAY, "bad steamid".into()))?; // invalid steamid in steam response (???)
+
+        state.cache.insert(header, id);
+        Ok(VerifiedUser(id))
+    }
+}
+
+// in-game structure representation in the database
+#[derive(Debug, Serialize, FromRow)]
 struct Structure {
     // DB-managed
     id: Option<i64>,         // AUTOINCREMENT PK
-    created_at: Option<i64>, // epoch millis
+    created_at: Option<i64>, // epoch millis (seconds actually)
 
-    // From client
+    // getting that from steam
     user_id: i64,
+
+    // from client
+    // bro is trusting client data
+    username: String,
     map_id: i32,
     scene: String,
     segment: i32,
@@ -54,12 +141,45 @@ struct Structure {
     antigrav: bool,
 }
 
+// in-game structure representation we receive as the payload for POST request
+#[derive(Debug, Deserialize)]
+struct NewStructure {
+    username: String,
+    map_id: i32,
+    scene: String,
+    segment: i32,
+    prefab: String,
+    pos_x: f32,
+    pos_y: f32,
+    pos_z: f32,
+    rot_x: f32,
+    rot_y: f32,
+    rot_z: f32,
+    rot_w: f32,
+    rope_start_x: f32,
+    rope_start_y: f32,
+    rope_start_z: f32,
+    rope_end_x: f32,
+    rope_end_y: f32,
+    rope_end_z: f32,
+    rope_length: f32,
+    rope_flying_rotation_x: f32,
+    rope_flying_rotation_y: f32,
+    rope_flying_rotation_z: f32,
+    rope_anchor_rotation_x: f32,
+    rope_anchor_rotation_y: f32,
+    rope_anchor_rotation_z: f32,
+    rope_anchor_rotation_w: f32,
+    antigrav: bool,
+}
+
 impl Structure {
-    /// Produce the SQLx query to insert and return the stored row.
     fn insert_query() -> &'static str {
         r#"
         INSERT INTO structures (
-            user_id, map_id, scene, segment, prefab,
+            user_id,
+            username,
+            map_id, scene, segment, prefab,
             pos_x, pos_y, pos_z,
             rot_x, rot_y, rot_z, rot_w,
             rope_start_x, rope_start_y, rope_start_z,
@@ -70,14 +190,14 @@ impl Structure {
             antigrav,
             created_at
         ) VALUES (
-            ?,?,?,?,?,
-            ?,?,?,
-            ?,?,?,?,
-            ?,?,?,
-            ?,?,?,
+            ?, ?, ?, ?, ?, ?,
+            ?, ?, ?,
+            ?, ?, ?, ?,
+            ?, ?, ?,
+            ?, ?, ?,
             ?,
-            ?,?,?,
-            ?,?,?,?,
+            ?, ?, ?,
+            ?, ?, ?, ?,
             ?,
             strftime('%s','now')*1000
         ) RETURNING *;
@@ -85,17 +205,14 @@ impl Structure {
     }
 }
 
-#[derive(Clone)]
-struct AppState {
-    db: SqlitePool,
-}
-
 async fn post_structure(
     State(state): State<AppState>,
-    Json(s): Json<Structure>,
+    VerifiedUser(steamid): VerifiedUser,
+    Json(s): Json<NewStructure>,
 ) -> Result<Json<Structure>, (StatusCode, String)> {
     let rec: Structure = sqlx::query_as::<_, Structure>(Structure::insert_query())
-        .bind(s.user_id)
+        .bind(steamid as i64)
+        .bind(&s.username)
         .bind(s.map_id)
         .bind(&s.scene)
         .bind(s.segment)
@@ -134,31 +251,96 @@ async fn post_structure(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
+    // 2. count how many this user already has in this scene
+    let (count,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM structures WHERE user_id = ? AND scene = ?")
+            .bind(steamid as i64)
+            .bind(&s.scene)
+            .fetch_one(&state.db)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // 3. if over the limit, delete the oldest one
+    if count > MAX_STRUCTS_PER_SCENE {
+        // grab the oldest id (OPTIONAL)
+        let oldest: Option<(i64,)> = sqlx::query_as::<_, (i64,)>(
+            "SELECT id FROM structures
+             WHERE user_id = ? AND scene = ?
+             ORDER BY created_at ASC, id ASC
+             LIMIT 1;",
+        )
+        .bind(steamid as i64)
+        .bind(&s.scene)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+        if let Some((oldest_id,)) = oldest {
+            // best-effort delete; ignore failure
+            let _ = sqlx::query("DELETE FROM structures WHERE id = ?")
+                .bind(oldest_id)
+                .execute(&state.db)
+                .await;
+        }
+    }
+
     Ok(Json(rec))
 }
 
 #[derive(Deserialize)]
 struct RandomParams {
-    map_id: i32,
+    scene: String,
+    map_id: Option<i32>,
     #[serde(default = "default_limit")]
     limit: i64,
 }
 fn default_limit() -> i64 {
-    5
+    30
 }
 
 async fn get_random(
     State(state): State<AppState>,
+    VerifiedUser(_): VerifiedUser,
     Query(p): Query<RandomParams>,
 ) -> Result<Json<Vec<Structure>>, (StatusCode, String)> {
-    let rows: Vec<Structure> = sqlx::query_as::<_, Structure>(
-        "SELECT * FROM structures WHERE map_id = ? ORDER BY RANDOM() LIMIT ?;",
-    )
-    .bind(p.map_id)
-    .bind(p.limit)
-    .fetch_all(&state.db)
-    .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if p.scene.len() > 50 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "scene must be ≤ 50 characters".into(),
+        ));
+    }
+    if p.limit < 1 || p.limit > 100 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "limit must be between 1 and 100".into(),
+        ));
+    }
+    let rows: Vec<Structure> = if let Some(id) = p.map_id {
+        sqlx::query_as::<_, Structure>(
+            "SELECT * FROM structures \
+             WHERE scene = ? AND map_id = ? \
+             ORDER BY RANDOM() \
+             LIMIT ?;",
+        )
+        .bind(&p.scene)
+        .bind(id)
+        .bind(p.limit)
+        .fetch_all(&state.db)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    } else {
+        sqlx::query_as::<_, Structure>(
+            "SELECT * FROM structures \
+             WHERE scene = ? \
+             ORDER BY RANDOM() \
+             LIMIT ?;",
+        )
+        .bind(&p.scene)
+        .bind(p.limit)
+        .fetch_all(&state.db)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    };
 
     Ok(Json(rows))
 }
@@ -168,6 +350,8 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::DEBUG)
         .init();
+
+    dotenv().ok();
 
     // create pool
     let db = SqlitePoolOptions::new()
@@ -181,11 +365,12 @@ async fn main() -> anyhow::Result<()> {
         r#"
         CREATE TABLE IF NOT EXISTS structures (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username  TEXT CHECK (length(username) <= 50),
             user_id   INTEGER NOT NULL,
             map_id    INTEGER NOT NULL,
-            scene     TEXT,
+            scene     TEXT NOT NULL CHECK (length(scene) <= 50),
             segment   INTEGER,
-            prefab    TEXT NOT NULL,
+            prefab    TEXT NOT NULL CHECK (length(prefab) <= 50),
             pos_x REAL, pos_y REAL, pos_z REAL,
             rot_x REAL, rot_y REAL, rot_z REAL, rot_w REAL,
             rope_start_x REAL, rope_start_y REAL, rope_start_z REAL,
@@ -201,13 +386,21 @@ async fn main() -> anyhow::Result<()> {
     .execute(&db)
     .await?;
 
-    let state = AppState { db };
+    let state = AppState {
+        db,
+        cache: Arc::new(DashMap::new()),
+        http: Client::builder()
+            .pool_max_idle_per_host(0)
+            .timeout(Duration::from_secs(5))
+            .build()?,
+        steam_key: env::var("STEAM_WEB_API_KEY").expect("STEAM_WEB_API_KEY missing"),
+    };
 
     let app = Router::new()
         .route("/api/v1/structures", get(get_random))
         .route("/api/v1/structures", post(post_structure))
         .layer(TraceLayer::new_for_http())
-        .with_state(state);
+        .with_state(state.clone());
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
     tracing::info!("Server listening on {:?}", listener);
