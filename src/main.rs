@@ -11,11 +11,15 @@ use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, SqlitePool, sqlite::SqlitePoolOptions};
 use std::env;
 use std::{sync::Arc, time::Duration};
+use tokio::time::Instant;
 use tower_http::trace::TraceLayer;
 
 static STEAM_HEADER: HeaderName = HeaderName::from_static("x-steam-auth"); // Header for Steam auth ticket
 static STEAM_APPID: u64 = 3527290; // Peak Stranding AppID
 const MAX_STRUCTS_PER_SCENE: i64 = 100;
+
+static POST_STRUCTURE_RATE_LIMIT: Duration = Duration::from_secs(2);
+static GET_STRUCTURE_RATE_LIMIT: Duration = Duration::from_secs(6);
 struct VerifiedUser(u64); // steam_id
 
 #[derive(Clone)]
@@ -24,6 +28,8 @@ struct AppState {
     cache: Arc<DashMap<String, u64>>,
     http: Client,
     steam_key: String,
+    post_structure_rate_limiter: Arc<DashMap<u64, Instant>>,
+    get_structure_rate_limiter: Arc<DashMap<u64, Instant>>,
 }
 
 //#[async_trait] // ???
@@ -210,6 +216,19 @@ async fn post_structure(
     VerifiedUser(steamid): VerifiedUser,
     Json(s): Json<NewStructure>,
 ) -> Result<Json<Structure>, (StatusCode, String)> {
+    // Rate limiting check for posting structures (2 seconds)
+    if let Some(last_post_time) = state.post_structure_rate_limiter.get(&steamid) {
+        if last_post_time.elapsed() < POST_STRUCTURE_RATE_LIMIT {
+            return Err((
+                StatusCode::TOO_MANY_REQUESTS,
+                "You are posting structures too frequently.".into(),
+            ));
+        }
+    }
+    state
+        .post_structure_rate_limiter
+        .insert(steamid, Instant::now());
+
     let rec: Structure = sqlx::query_as::<_, Structure>(Structure::insert_query())
         .bind(steamid as i64)
         .bind(&s.username)
@@ -300,9 +319,20 @@ fn default_limit() -> i64 {
 
 async fn get_random(
     State(state): State<AppState>,
-    VerifiedUser(_): VerifiedUser,
+    VerifiedUser(steamid): VerifiedUser,
     Query(p): Query<RandomParams>,
 ) -> Result<Json<Vec<Structure>>, (StatusCode, String)> {
+    if let Some(last_get_time) = state.get_structure_rate_limiter.get(&steamid) {
+        if last_get_time.elapsed() < GET_STRUCTURE_RATE_LIMIT {
+            return Err((
+                StatusCode::TOO_MANY_REQUESTS,
+                "You are requesting structures too frequently.".into(),
+            ));
+        }
+    }
+    state
+        .get_structure_rate_limiter
+        .insert(steamid, Instant::now());
     if p.scene.len() > 50 {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -394,6 +424,8 @@ async fn main() -> anyhow::Result<()> {
             .timeout(Duration::from_secs(5))
             .build()?,
         steam_key: env::var("STEAM_WEB_API_KEY").expect("STEAM_WEB_API_KEY missing"),
+        post_structure_rate_limiter: Arc::new(DashMap::new()),
+        get_structure_rate_limiter: Arc::new(DashMap::new()),
     };
 
     let app = Router::new()
