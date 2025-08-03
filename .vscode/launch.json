@@ -1,0 +1,24 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Build and Debug Rust",
+            "program": "${workspaceFolder}/target/debug/peakstranding_server",
+            "args": [],
+            "cwd": "${workspaceFolder}",
+            "stopOnEntry": false,
+            "preLaunchTask": "rust: cargo build"
+        },
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug Rust",
+            "program": "${workspaceFolder}/target/debug/peakstranding_server",
+            "args": [],
+            "cwd": "${workspaceFolder}",
+            "stopOnEntry": false,
+        }
+    ]
+}
