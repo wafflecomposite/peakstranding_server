@@ -229,6 +229,14 @@ async fn post_structure(
         .post_structure_rate_limiter
         .insert(steamid, Instant::now());
 
+    // Begin a transaction to perform all database operations at once.
+    let mut tx = state
+        .db
+        .begin()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // 1. Insert the new structure.
     let rec: Structure = sqlx::query_as::<_, Structure>(Structure::insert_query())
         .bind(steamid as i64)
         .bind(&s.username)
@@ -266,42 +274,45 @@ async fn post_structure(
         .bind(s.rope_anchor_rotation_w)
         // antigrav
         .bind(s.antigrav)
-        .fetch_one(&state.db)
+        .fetch_one(&mut *tx) // Use the transaction object 'tx'
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    // 2. count how many this user already has in this scene
+    // 2. Count how many structures this user already has in this scene.
     let (count,): (i64,) =
         sqlx::query_as("SELECT COUNT(*) FROM structures WHERE user_id = ? AND scene = ?")
             .bind(steamid as i64)
             .bind(&s.scene)
-            .fetch_one(&state.db)
+            .fetch_one(&mut *tx) // Use the transaction object 'tx'
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    // 3. if over the limit, delete the oldest one
+    // 3. If over the limit, delete the oldest one.
     if count > MAX_STRUCTS_PER_SCENE {
-        // grab the oldest id (OPTIONAL)
-        let oldest: Option<(i64,)> = sqlx::query_as::<_, (i64,)>(
-            "SELECT id FROM structures
-             WHERE user_id = ? AND scene = ?
-             ORDER BY created_at ASC, id ASC
-             LIMIT 1;",
-        )
-        .bind(steamid as i64)
-        .bind(&s.scene)
-        .fetch_optional(&state.db)
+        // This can be optimized further by combining the SELECT and DELETE
+        // into a single query using a Common Table Expression (CTE).
+        let delete_query = r#"
+            DELETE FROM structures
+            WHERE id = (
+                SELECT id FROM structures
+                WHERE user_id = ? AND scene = ?
+                ORDER BY created_at ASC, id ASC
+                LIMIT 1
+            );
+        "#;
+
+        // Best-effort delete; ignore failure within the transaction for this specific logic.
+        let _ = sqlx::query(delete_query)
+            .bind(steamid as i64)
+            .bind(&s.scene)
+            .execute(&mut *tx) // Use the transaction object 'tx'
+            .await;
+    }
+
+    // Commit the transaction to finalize all changes.
+    tx.commit()
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-        if let Some((oldest_id,)) = oldest {
-            // best-effort delete; ignore failure
-            let _ = sqlx::query("DELETE FROM structures WHERE id = ?")
-                .bind(oldest_id)
-                .execute(&state.db)
-                .await;
-        }
-    }
 
     Ok(Json(rec))
 }
