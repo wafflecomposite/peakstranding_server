@@ -16,7 +16,8 @@ use tower_http::trace::TraceLayer;
 
 static STEAM_HEADER: HeaderName = HeaderName::from_static("x-steam-auth"); // Header for Steam auth ticket
 static STEAM_APPID: u64 = 3527290; // Peak Stranding AppID
-const MAX_STRUCTS_PER_SCENE: i64 = 100;
+const MAX_USER_STRUCTS_SAVED_PER_SCENE: i64 = 100;
+const MAX_REQUESTED_STRUCTS: i64 = 150;
 
 static POST_STRUCTURE_RATE_LIMIT: Duration = Duration::from_secs(2);
 static GET_STRUCTURE_RATE_LIMIT: Duration = Duration::from_secs(6);
@@ -288,7 +289,7 @@ async fn post_structure(
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     // 3. If over the limit, delete the oldest one.
-    if count > MAX_STRUCTS_PER_SCENE {
+    if count > MAX_USER_STRUCTS_SAVED_PER_SCENE {
         // This can be optimized further by combining the SELECT and DELETE
         // into a single query using a Common Table Expression (CTE).
         let delete_query = r#"
@@ -350,12 +351,7 @@ async fn get_random(
             "scene must be ≤ 50 characters".into(),
         ));
     }
-    if p.limit < 1 || p.limit > 100 {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "limit must be between 1 and 100".into(),
-        ));
-    }
+    let limit = p.limit.clamp(0, MAX_REQUESTED_STRUCTS);
 
     // We use a Common Table Expression (CTE) to rank structures.
     // The ranking is partitioned by user_id and segment to ensure diversity.
@@ -395,7 +391,7 @@ async fn get_random(
         sqlx::query_as::<_, Structure>(&full_query)
             .bind(&p.scene)
             .bind(id)
-            .bind(p.limit)
+            .bind(limit)
             .fetch_all(&state.db)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
@@ -403,7 +399,7 @@ async fn get_random(
         let full_query = format!("{} WHERE scene = ? {}", base_query, final_select);
         sqlx::query_as::<_, Structure>(&full_query)
             .bind(&p.scene)
-            .bind(p.limit)
+            .bind(limit)
             .fetch_all(&state.db)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
