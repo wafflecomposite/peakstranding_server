@@ -17,7 +17,7 @@ use tower_http::trace::TraceLayer;
 static STEAM_HEADER: HeaderName = HeaderName::from_static("x-steam-auth"); // Header for Steam auth ticket
 static STEAM_APPID: u64 = 3527290; // Peak Stranding AppID
 const MAX_USER_STRUCTS_SAVED_PER_SCENE: i64 = 100;
-const MAX_REQUESTED_STRUCTS: i64 = 150;
+const MAX_REQUESTED_STRUCTS: i64 = 300;
 
 static POST_STRUCTURE_RATE_LIMIT: Duration = Duration::from_secs(2);
 static GET_STRUCTURE_RATE_LIMIT: Duration = Duration::from_secs(6);
@@ -324,6 +324,7 @@ struct RandomParams {
     map_id: Option<i32>,
     #[serde(default = "default_limit")]
     limit: i64,
+    exclude_prefabs: Option<String>,
 }
 fn default_limit() -> i64 {
     30
@@ -383,27 +384,46 @@ async fn get_random(
         LIMIT ?;
     "#;
 
-    let rows: Vec<Structure> = if let Some(id) = p.map_id {
-        let full_query = format!(
-            "{} WHERE scene = ? AND map_id = ? {}",
-            base_query, final_select
-        );
-        sqlx::query_as::<_, Structure>(&full_query)
-            .bind(&p.scene)
-            .bind(id)
-            .bind(limit)
-            .fetch_all(&state.db)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-    } else {
-        let full_query = format!("{} WHERE scene = ? {}", base_query, final_select);
-        sqlx::query_as::<_, Structure>(&full_query)
-            .bind(&p.scene)
-            .bind(limit)
-            .fetch_all(&state.db)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-    };
+    let mut where_conditions = vec!["scene = ?".to_string()];
+
+    if p.map_id.is_some() {
+        where_conditions.push("map_id = ?".to_string());
+    }
+
+    let prefabs_to_exclude: Vec<String> = p
+        .exclude_prefabs
+        .as_deref()
+        .unwrap_or("")
+        .split(',')
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect();
+    // If there are prefabs to exclude, generate the "NOT IN" clause
+    if !prefabs_to_exclude.is_empty() {
+        // Create a placeholder string like "(?, ?, ?)"
+        let placeholders = format!("({})", vec!["?"; prefabs_to_exclude.len()].join(","));
+        where_conditions.push(format!("prefab NOT IN {}", placeholders));
+    }
+    // Combine all parts into the final SQL query string
+    let full_query = format!(
+        "{} WHERE {} {}",
+        base_query,
+        where_conditions.join(" AND "),
+        final_select
+    );
+    //tracing::debug!("Executing query: {}", full_query);
+    let mut query = sqlx::query_as::<_, Structure>(&full_query).bind(&p.scene);
+    if let Some(id) = p.map_id {
+        query = query.bind(id);
+    }
+    for prefab_name in &prefabs_to_exclude {
+        query = query.bind(prefab_name);
+    }
+    query = query.bind(limit);
+    let rows = query
+        .fetch_all(&state.db)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok(Json(rows))
 }
