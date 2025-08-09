@@ -1,6 +1,6 @@
 use axum::{
     Json, Router,
-    extract::{FromRequestParts, Query, State},
+    extract::{FromRequestParts, Path, Query, State},
     http::{HeaderName, StatusCode},
     routing::{get, post},
 };
@@ -8,6 +8,7 @@ use dashmap::DashMap;
 use dotenvy::dotenv;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use sqlx::Row;
 use sqlx::{FromRow, SqlitePool, sqlite::SqlitePoolOptions};
 use std::env;
 use std::{sync::Arc, time::Duration};
@@ -21,6 +22,7 @@ const MAX_REQUESTED_STRUCTS: i64 = 300;
 
 static POST_STRUCTURE_RATE_LIMIT: Duration = Duration::from_secs(2);
 static GET_STRUCTURE_RATE_LIMIT: Duration = Duration::from_secs(6);
+static POST_LIKE_RATE_LIMIT: Duration = Duration::from_secs(1);
 struct VerifiedUser(u64); // steam_id
 
 #[derive(Clone)]
@@ -31,6 +33,7 @@ struct AppState {
     steam_key: String,
     post_structure_rate_limiter: Arc<DashMap<u64, Instant>>,
     get_structure_rate_limiter: Arc<DashMap<u64, Instant>>,
+    post_like_rate_limiter: Arc<DashMap<u64, Instant>>,
 }
 
 //#[async_trait] // ???
@@ -146,6 +149,8 @@ struct Structure {
     rope_anchor_rotation_w: f32,
 
     antigrav: bool,
+
+    likes: i32,
 }
 
 // in-game structure representation we receive as the payload for POST request
@@ -236,6 +241,16 @@ async fn post_structure(
         .begin()
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // 0. Ensure the posting user exists in users table
+    sqlx::query(
+        r#"INSERT OR IGNORE INTO users (user_id, upload_banned, likes_received, likes_send)
+           VALUES (?, 0, 0, 0);"#,
+    )
+    .bind(steamid as i64)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     // 1. Insert the new structure.
     let rec: Structure = sqlx::query_as::<_, Structure>(Structure::insert_query())
@@ -378,13 +393,14 @@ async fn get_random(
             rope_length,
             rope_flying_rotation_x, rope_flying_rotation_y, rope_flying_rotation_z,
             rope_anchor_rotation_x, rope_anchor_rotation_y, rope_anchor_rotation_z, rope_anchor_rotation_w,
-            antigrav
+            antigrav,
+            likes
         FROM RankedStructures
         ORDER BY diversity_rank, RANDOM()
         LIMIT ?;
     "#;
 
-    let mut where_conditions = vec!["scene = ?".to_string()];
+    let mut where_conditions = vec!["scene = ?".to_string(), "deleted = 0".to_string()];
 
     if p.map_id.is_some() {
         where_conditions.push("map_id = ?".to_string());
@@ -428,6 +444,98 @@ async fn get_random(
     Ok(Json(rows))
 }
 
+#[derive(Deserialize)]
+struct LikeBody {
+    count: Option<i32>,
+}
+
+async fn like_structure(
+    State(state): State<AppState>,
+    VerifiedUser(steamid): VerifiedUser,
+    Path(id): Path<i64>,
+    Json(body): Json<LikeBody>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    // Per-user rate limit for likes (1s)
+    if let Some(last) = state.post_like_rate_limiter.get(&steamid) {
+        if last.elapsed() < POST_LIKE_RATE_LIMIT {
+            return Err((
+                StatusCode::TOO_MANY_REQUESTS,
+                "You are liking too frequently.".into(),
+            ));
+        }
+    }
+    state.post_like_rate_limiter.insert(steamid, Instant::now());
+
+    let mut tx = state
+        .db
+        .begin()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // Validate structure and get owner
+    let owner: Option<(i64,)> =
+        sqlx::query_as("SELECT user_id FROM structures WHERE id = ? AND deleted = 0")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let Some((owner_user_id,)) = owner else {
+        tx.rollback().await.ok();
+        return Err((StatusCode::NOT_FOUND, "Structure not found".into()));
+    };
+
+    // Normalize count
+    let mut count = body.count.unwrap_or(1);
+    if count <= 0 {
+        count = 1;
+    }
+
+    // Ensure liker and owner exist in users
+    sqlx::query(r#"INSERT INTO users (user_id) VALUES (?) ON CONFLICT(user_id) DO NOTHING;"#)
+        .bind(steamid as i64)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    sqlx::query(r#"INSERT INTO users (user_id) VALUES (?) ON CONFLICT(user_id) DO NOTHING;"#)
+        .bind(owner_user_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // Update structure likes
+    let updated =
+        sqlx::query("UPDATE structures SET likes = likes + ? WHERE id = ? AND deleted = 0")
+            .bind(count)
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if updated.rows_affected() == 0 {
+        tx.rollback().await.ok();
+        return Err((StatusCode::NOT_FOUND, "Structure not found".into()));
+    }
+
+    // Update users metrics
+    sqlx::query("UPDATE users SET likes_send = likes_send + ? WHERE user_id = ?")
+        .bind(count)
+        .bind(steamid as i64)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    sqlx::query("UPDATE users SET likes_received = likes_received + ? WHERE user_id = ?")
+        .bind(count)
+        .bind(owner_user_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    tx.commit()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -469,6 +577,9 @@ async fn main() -> anyhow::Result<()> {
     .execute(&db)
     .await?;
 
+    // apply non-destructive migrations if needed
+    apply_migrations(&db).await?;
+
     let state = AppState {
         db,
         cache: Arc::new(DashMap::new()),
@@ -479,11 +590,13 @@ async fn main() -> anyhow::Result<()> {
         steam_key: env::var("STEAM_WEB_API_KEY").expect("STEAM_WEB_API_KEY missing"),
         post_structure_rate_limiter: Arc::new(DashMap::new()),
         get_structure_rate_limiter: Arc::new(DashMap::new()),
+        post_like_rate_limiter: Arc::new(DashMap::new()),
     };
 
     let app = Router::new()
         .route("/api/v1/structures", get(get_random))
         .route("/api/v1/structures", post(post_structure))
+        .route("/api/v1/structures/{id}/like", post(like_structure))
         .layer(TraceLayer::new_for_http())
         .with_state(state.clone());
 
@@ -492,4 +605,74 @@ async fn main() -> anyhow::Result<()> {
     axum::serve(listener, app).await.unwrap();
 
     Ok(())
+}
+
+// --- migrations ---
+async fn apply_migrations(db: &SqlitePool) -> Result<(), sqlx::Error> {
+    // Ensure users table exists
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS users (
+            user_id       INTEGER PRIMARY KEY,
+            upload_banned BOOLEAN NOT NULL DEFAULT 0,
+            likes_received INTEGER NOT NULL DEFAULT 0,
+            likes_send     INTEGER NOT NULL DEFAULT 0
+        );
+        "#,
+    )
+    .execute(db)
+    .await?;
+
+    // Add columns to structures if missing
+    if !column_exists(db, "structures", "likes").await? {
+        sqlx::query("ALTER TABLE structures ADD COLUMN likes INTEGER NOT NULL DEFAULT 0;")
+            .execute(db)
+            .await?;
+    }
+    if !column_exists(db, "structures", "deleted").await? {
+        sqlx::query("ALTER TABLE structures ADD COLUMN deleted BOOLEAN NOT NULL DEFAULT 0;")
+            .execute(db)
+            .await?;
+    }
+    // Create helpful indexes (idempotent)
+    // Filter path in get_random: WHERE scene = ? AND deleted = 0 [AND map_id = ?]
+    sqlx::query(
+        r#"CREATE INDEX IF NOT EXISTS idx_structures_scene_deleted_map
+           ON structures(scene, map_id, deleted);"#,
+    )
+    .execute(db)
+    .await?;
+
+    // Oldest-per-user-per-scene pruning: ORDER BY created_at, id WHERE user_id = ? AND scene = ?
+    sqlx::query(
+        r#"CREATE INDEX IF NOT EXISTS idx_structures_user_scene_created
+           ON structures(user_id, scene, created_at, id);"#,
+    )
+    .execute(db)
+    .await?;
+
+    // Exclusion by prefab (NOT IN ...) can benefit from an index on prefab
+    sqlx::query(
+        r#"CREATE INDEX IF NOT EXISTS idx_structures_prefab
+           ON structures(prefab);"#,
+    )
+    .execute(db)
+    .await?;
+
+    Ok(())
+}
+
+async fn column_exists(db: &SqlitePool, table: &str, column: &str) -> Result<bool, sqlx::Error> {
+    let mut rows = sqlx::query(&format!("PRAGMA table_info({});", table))
+        .fetch_all(db)
+        .await?;
+
+    // PRAGMA table_info columns: cid, name, type, notnull, dflt_value, pk
+    for row in rows.drain(..) {
+        let name: String = row.try_get("name").unwrap_or_default();
+        if name.eq_ignore_ascii_case(column) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
