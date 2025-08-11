@@ -8,9 +8,12 @@ use dashmap::DashMap;
 use dotenvy::dotenv;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use sqlx::Row;
-use sqlx::{FromRow, SqlitePool, sqlite::SqlitePoolOptions};
-use std::env;
+use sqlx::{
+    FromRow, SqlitePool,
+    sqlite::{SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous},
+};
+use sqlx::{Row, sqlite::SqliteConnectOptions};
+use std::{env, str::FromStr};
 use std::{sync::Arc, time::Duration};
 use tokio::time::Instant;
 use tower_http::trace::TraceLayer;
@@ -236,11 +239,10 @@ async fn post_structure(
         .insert(steamid, Instant::now());
 
     // Begin a transaction to perform all database operations at once.
-    let mut tx = state
-        .db
-        .begin()
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let mut tx = state.db.begin().await.map_err(|e| {
+        tracing::error!("like tx begin failed: {}", e);
+        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+    })?;
 
     // 0. Ensure the posting user exists in users table
     sqlx::query(
@@ -455,6 +457,12 @@ async fn like_structure(
     Path(id): Path<i64>,
     Json(body): Json<LikeBody>,
 ) -> Result<StatusCode, (StatusCode, String)> {
+    tracing::info!(
+        "POST like start steamid={} structure_id={} raw_count={:?}",
+        steamid,
+        id,
+        body.count
+    );
     // Per-user rate limit for likes (1s)
     if let Some(last) = state.post_like_rate_limiter.get(&steamid) {
         if last.elapsed() < POST_LIKE_RATE_LIMIT {
@@ -478,29 +486,46 @@ async fn like_structure(
             .bind(id)
             .fetch_optional(&mut *tx)
             .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            .map_err(|e| {
+                tracing::error!("like select owner failed: {}", e);
+                (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+            })?;
     let Some((owner_user_id,)) = owner else {
         tx.rollback().await.ok();
         return Err((StatusCode::NOT_FOUND, "Structure not found".into()));
     };
+    tracing::info!("like owner_user_id={}", owner_user_id);
 
     // Normalize count
     let mut count = body.count.unwrap_or(1);
     if count <= 0 {
         count = 1;
     }
+    tracing::info!("like normalized_count={}", count);
 
     // Ensure liker and owner exist in users
-    sqlx::query(r#"INSERT INTO users (user_id) VALUES (?) ON CONFLICT(user_id) DO NOTHING;"#)
-        .bind(steamid as i64)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    sqlx::query(r#"INSERT INTO users (user_id) VALUES (?) ON CONFLICT(user_id) DO NOTHING;"#)
-        .bind(owner_user_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    sqlx::query(
+        r#"INSERT OR IGNORE INTO users (user_id, upload_banned, likes_received, likes_send)
+           VALUES (?, 0, 0, 0);"#,
+    )
+    .bind(steamid as i64)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| {
+        tracing::error!("like ensure liker failed: {}", e);
+        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+    })?;
+    sqlx::query(
+        r#"INSERT OR IGNORE INTO users (user_id, upload_banned, likes_received, likes_send)
+           VALUES (?, 0, 0, 0);"#,
+    )
+    .bind(owner_user_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| {
+        tracing::error!("like ensure owner failed: {}", e);
+        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+    })?;
 
     // Update structure likes
     let updated =
@@ -509,7 +534,10 @@ async fn like_structure(
             .bind(id)
             .execute(&mut *tx)
             .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            .map_err(|e| {
+                tracing::error!("like update structure failed: {}", e);
+                (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+            })?;
     if updated.rows_affected() == 0 {
         tx.rollback().await.ok();
         return Err((StatusCode::NOT_FOUND, "Structure not found".into()));
@@ -521,18 +549,31 @@ async fn like_structure(
         .bind(steamid as i64)
         .execute(&mut *tx)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| {
+            tracing::error!("like update liker stats failed: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        })?;
     sqlx::query("UPDATE users SET likes_received = likes_received + ? WHERE user_id = ?")
         .bind(count)
         .bind(owner_user_id)
         .execute(&mut *tx)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| {
+            tracing::error!("like update owner stats failed: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        })?;
 
-    tx.commit()
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    tx.commit().await.map_err(|e| {
+        tracing::error!("like tx commit failed: {}", e);
+        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+    })?;
 
+    tracing::info!(
+        "POST like success steamid={} structure_id={} count={}",
+        steamid,
+        id,
+        count
+    );
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -544,11 +585,15 @@ async fn main() -> anyhow::Result<()> {
 
     dotenv().ok();
 
-    // create pool
+    let connect_opts = SqliteConnectOptions::from_str("sqlite://peakstranding.db?mode=rwc")?
+        .journal_mode(SqliteJournalMode::Wal)
+        .synchronous(SqliteSynchronous::Normal)
+        .busy_timeout(std::time::Duration::from_secs(5));
+
     let db = SqlitePoolOptions::new()
         .max_connections(4)
         .idle_timeout(Duration::from_secs(30))
-        .connect("sqlite://peakstranding.db?mode=rwc")
+        .connect_with(connect_opts)
         .await?;
 
     // one‑shot schema (extra NULL columns allowed)
