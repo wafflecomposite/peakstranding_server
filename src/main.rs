@@ -496,6 +496,20 @@ async fn like_structure(
     };
     tracing::info!("like owner_user_id={}", owner_user_id);
 
+    // Forbid self-like attempts
+    if owner_user_id == steamid as i64 {
+        tracing::warn!(
+            "like denied: self-like attempt steamid={} structure_id={}",
+            steamid,
+            id
+        );
+        tx.rollback().await.ok();
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Cannot like your own structure.".into(),
+        ));
+    }
+
     // Normalize count
     let mut count = body.count.unwrap_or(1);
     if count <= 0 {
