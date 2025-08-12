@@ -1,7 +1,7 @@
 use axum::{
     Json, Router,
-    extract::{FromRequestParts, Path, Query, State},
-    http::{HeaderName, StatusCode},
+    extract::{FromRequestParts, OriginalUri, Path, Query, State},
+    http::{HeaderName, Method, StatusCode},
     routing::{get, post},
 };
 use dashmap::DashMap;
@@ -9,14 +9,15 @@ use dotenvy::dotenv;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sqlx::{
-    FromRow, SqlitePool,
-    sqlite::{SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous},
+    FromRow, Row, SqlitePool,
+    sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous},
 };
-use sqlx::{Row, sqlite::SqliteConnectOptions};
 use std::{env, str::FromStr};
 use std::{sync::Arc, time::Duration};
 use tokio::time::Instant;
-use tower_http::trace::TraceLayer;
+// Removed TraceLayer so we only emit our own compact logs
+// use tower_http::trace::TraceLayer;
+use tracing_subscriber::{EnvFilter, fmt};
 
 static STEAM_HEADER: HeaderName = HeaderName::from_static("x-steam-auth"); // Header for Steam auth ticket
 static STEAM_APPID: u64 = 3527290; // Peak Stranding AppID
@@ -39,7 +40,7 @@ struct AppState {
     post_like_rate_limiter: Arc<DashMap<u64, Instant>>,
 }
 
-//#[async_trait] // ???
+//#[async_trait] // not needed for axum 0.7's FromRequestParts
 impl FromRequestParts<AppState> for VerifiedUser {
     type Rejection = (StatusCode, String);
 
@@ -79,18 +80,38 @@ impl FromRequestParts<AppState> for VerifiedUser {
             steamid: String,
         }
 
-        let res: SteamResp = state
-            .http
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))? // we haven't got a response
-            .json()
-            .await
-            .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?; // we haven't got a _proper_ response
+        let start = Instant::now();
+        let resp = match state.http.get(&url).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(
+                    "steam_auth called result=transport_error error={} duration_ms={}",
+                    e,
+                    start.elapsed().as_millis()
+                );
+                return Err((StatusCode::BAD_GATEWAY, e.to_string()));
+            }
+        };
+        let res: SteamResp = match resp.json().await {
+            Ok(j) => j,
+            Err(e) => {
+                tracing::warn!(
+                    "steam_auth called result=bad_json error={} duration_ms={}",
+                    e,
+                    start.elapsed().as_millis()
+                );
+                return Err((StatusCode::BAD_GATEWAY, e.to_string()));
+            }
+        };
 
         if res.response.params.result != "OK" {
-            return Err((StatusCode::UNAUTHORIZED, "ticket rejected".into())); // ticket is trash
+            tracing::warn!(
+                "steam_auth called result={} steamid={} duration_ms={}",
+                res.response.params.result,
+                res.response.params.steamid,
+                start.elapsed().as_millis()
+            );
+            return Err((StatusCode::UNAUTHORIZED, "ticket rejected".into()));
         }
 
         let id = res
@@ -98,7 +119,13 @@ impl FromRequestParts<AppState> for VerifiedUser {
             .params
             .steamid
             .parse::<u64>()
-            .map_err(|_| (StatusCode::BAD_GATEWAY, "bad steamid".into()))?; // invalid steamid in steam response (???)
+            .map_err(|_| (StatusCode::BAD_GATEWAY, "bad steamid".into()))?;
+
+        tracing::info!(
+            "steam_auth called result=OK steamid={} duration_ms={}",
+            id,
+            start.elapsed().as_millis()
+        );
 
         state.cache.insert(header, id);
         Ok(VerifiedUser(id))
@@ -116,7 +143,6 @@ struct Structure {
     user_id: i64,
 
     // from client
-    // bro is trusting client data
     username: String,
     map_id: i32,
     scene: String,
@@ -223,11 +249,26 @@ impl Structure {
 async fn post_structure(
     State(state): State<AppState>,
     VerifiedUser(steamid): VerifiedUser,
+    OriginalUri(uri): OriginalUri,
+    method: Method,
     Json(s): Json<NewStructure>,
 ) -> Result<Json<Structure>, (StatusCode, String)> {
+    let started = Instant::now();
+
     // Rate limiting check for posting structures (2 seconds)
     if let Some(last_post_time) = state.post_structure_rate_limiter.get(&steamid) {
         if last_post_time.elapsed() < POST_STRUCTURE_RATE_LIMIT {
+            let dur = started.elapsed().as_millis();
+            let url = uri.to_string();
+            tracing::warn!(
+                "request user_id={} method={} url={} status=429 duration_ms={} level={} map_id={}",
+                steamid,
+                method.as_str(),
+                url,
+                dur,
+                s.scene,
+                s.map_id
+            );
             return Err((
                 StatusCode::TOO_MANY_REQUESTS,
                 "You are posting structures too frequently.".into(),
@@ -240,7 +281,14 @@ async fn post_structure(
 
     // Begin a transaction to perform all database operations at once.
     let mut tx = state.db.begin().await.map_err(|e| {
-        tracing::error!("like tx begin failed: {}", e);
+        let dur = started.elapsed().as_millis();
+        tracing::error!(
+            "request user_id={} method={} url={} status=500 duration_ms={} error=like_tx_begin_failed",
+            steamid,
+            method.as_str(),
+            uri.to_string(),
+            dur
+        );
         (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
     })?;
 
@@ -252,7 +300,17 @@ async fn post_structure(
     .bind(steamid as i64)
     .execute(&mut *tx)
     .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    .map_err(|e| {
+        let dur = started.elapsed().as_millis();
+        tracing::error!(
+            "request user_id={} method={} url={} status=500 duration_ms={} error=ensure_user_failed",
+            steamid,
+            method.as_str(),
+            uri.to_string(),
+            dur
+        );
+        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+    })?;
 
     // 1. Insert the new structure.
     let rec: Structure = sqlx::query_as::<_, Structure>(Structure::insert_query())
@@ -292,23 +350,41 @@ async fn post_structure(
         .bind(s.rope_anchor_rotation_w)
         // antigrav
         .bind(s.antigrav)
-        .fetch_one(&mut *tx) // Use the transaction object 'tx'
+        .fetch_one(&mut *tx)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| {
+            let dur = started.elapsed().as_millis();
+            tracing::error!(
+                "request user_id={} method={} url={} status=500 duration_ms={} error=insert_structure_failed",
+                steamid,
+                method.as_str(),
+                uri.to_string(),
+                dur
+            );
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        })?;
 
     // 2. Count how many structures this user already has in this scene.
     let (count,): (i64,) =
         sqlx::query_as("SELECT COUNT(*) FROM structures WHERE user_id = ? AND scene = ?")
             .bind(steamid as i64)
             .bind(&s.scene)
-            .fetch_one(&mut *tx) // Use the transaction object 'tx'
+            .fetch_one(&mut *tx)
             .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            .map_err(|e| {
+                let dur = started.elapsed().as_millis();
+                tracing::error!(
+                    "request user_id={} method={} url={} status=500 duration_ms={} error=count_structures_failed",
+                    steamid,
+                    method.as_str(),
+                    uri.to_string(),
+                    dur
+                );
+                (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+            })?;
 
     // 3. If over the limit, delete the oldest one.
     if count > MAX_USER_STRUCTS_SAVED_PER_SCENE {
-        // This can be optimized further by combining the SELECT and DELETE
-        // into a single query using a Common Table Expression (CTE).
         let delete_query = r#"
             DELETE FROM structures
             WHERE id = (
@@ -319,18 +395,36 @@ async fn post_structure(
             );
         "#;
 
-        // Best-effort delete; ignore failure within the transaction for this specific logic.
         let _ = sqlx::query(delete_query)
             .bind(steamid as i64)
             .bind(&s.scene)
-            .execute(&mut *tx) // Use the transaction object 'tx'
+            .execute(&mut *tx)
             .await;
     }
 
     // Commit the transaction to finalize all changes.
-    tx.commit()
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    tx.commit().await.map_err(|e| {
+        let dur = started.elapsed().as_millis();
+        tracing::error!(
+            "request user_id={} method={} url={} status=500 duration_ms={} error=tx_commit_failed",
+            steamid,
+            method.as_str(),
+            uri.to_string(),
+            dur
+        );
+        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+    })?;
+
+    let dur = started.elapsed().as_millis();
+    tracing::info!(
+        "request user_id={} method={} url={} status=200 duration_ms={} level={} map_id={}",
+        steamid,
+        method.as_str(),
+        uri.to_string(),
+        dur,
+        s.scene,
+        s.map_id
+    );
 
     Ok(Json(rec))
 }
@@ -350,10 +444,22 @@ fn default_limit() -> i64 {
 async fn get_random(
     State(state): State<AppState>,
     VerifiedUser(steamid): VerifiedUser,
+    OriginalUri(uri): OriginalUri,
+    method: Method,
     Query(p): Query<RandomParams>,
 ) -> Result<Json<Vec<Structure>>, (StatusCode, String)> {
+    let started = Instant::now();
+
     if let Some(last_get_time) = state.get_structure_rate_limiter.get(&steamid) {
         if last_get_time.elapsed() < GET_STRUCTURE_RATE_LIMIT {
+            let dur = started.elapsed().as_millis();
+            tracing::warn!(
+                "request user_id={} method={} url={} status=429 duration_ms={}",
+                steamid,
+                method.as_str(),
+                uri.to_string(),
+                dur
+            );
             return Err((
                 StatusCode::TOO_MANY_REQUESTS,
                 "You are requesting structures too frequently.".into(),
@@ -363,7 +469,16 @@ async fn get_random(
     state
         .get_structure_rate_limiter
         .insert(steamid, Instant::now());
+
     if p.scene.len() > 50 {
+        let dur = started.elapsed().as_millis();
+        tracing::warn!(
+            "request user_id={} method={} url={} status=400 duration_ms={} reason=scene_too_long",
+            steamid,
+            method.as_str(),
+            uri.to_string(),
+            dur
+        );
         return Err((
             StatusCode::BAD_REQUEST,
             "scene must be ≤ 50 characters".into(),
@@ -371,8 +486,6 @@ async fn get_random(
     }
     let limit = p.limit.clamp(0, MAX_REQUESTED_STRUCTS);
 
-    // We use a Common Table Expression (CTE) to rank structures.
-    // The ranking is partitioned by user_id and segment to ensure diversity.
     let base_query = r#"
         WITH RankedStructures AS (
             SELECT
@@ -381,10 +494,6 @@ async fn get_random(
             FROM structures
     "#;
 
-    // The final SELECT statement orders by our new diversity rank,
-    // ensuring we get a varied selection first.
-    // We must explicitly list columns because the CTE adds `diversity_rank`,
-    // which is not part of the `Structure` struct.
     let final_select = r#"
         )
         SELECT
@@ -416,20 +525,19 @@ async fn get_random(
         .filter(|s| !s.is_empty())
         .map(String::from)
         .collect();
-    // If there are prefabs to exclude, generate the "NOT IN" clause
+
     if !prefabs_to_exclude.is_empty() {
-        // Create a placeholder string like "(?, ?, ?)"
         let placeholders = format!("({})", vec!["?"; prefabs_to_exclude.len()].join(","));
         where_conditions.push(format!("prefab NOT IN {}", placeholders));
     }
-    // Combine all parts into the final SQL query string
+
     let full_query = format!(
         "{} WHERE {} {}",
         base_query,
         where_conditions.join(" AND "),
         final_select
     );
-    //tracing::debug!("Executing query: {}", full_query);
+
     let mut query = sqlx::query_as::<_, Structure>(&full_query).bind(&p.scene);
     if let Some(id) = p.map_id {
         query = query.bind(id);
@@ -438,10 +546,27 @@ async fn get_random(
         query = query.bind(prefab_name);
     }
     query = query.bind(limit);
-    let rows = query
-        .fetch_all(&state.db)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let rows = query.fetch_all(&state.db).await.map_err(|e| {
+        let dur = started.elapsed().as_millis();
+        tracing::error!(
+            "request user_id={} method={} url={} status=500 duration_ms={} error=query_failed",
+            steamid,
+            method.as_str(),
+            uri.to_string(),
+            dur
+        );
+        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+    })?;
+
+    let dur = started.elapsed().as_millis();
+    tracing::info!(
+        "request user_id={} method={} url={} status=200 duration_ms={}",
+        steamid,
+        method.as_str(),
+        uri.to_string(),
+        dur
+    );
 
     Ok(Json(rows))
 }
@@ -454,18 +579,26 @@ struct LikeBody {
 async fn like_structure(
     State(state): State<AppState>,
     VerifiedUser(steamid): VerifiedUser,
+    OriginalUri(uri): OriginalUri,
+    method: Method,
     Path(id): Path<i64>,
     Json(body): Json<LikeBody>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    tracing::info!(
-        "POST like start steamid={} structure_id={} raw_count={:?}",
-        steamid,
-        id,
-        body.count
-    );
+    let started = Instant::now();
+    let requested = body.count.unwrap_or(1); // log before clamp
+
     // Per-user rate limit for likes (1s)
     if let Some(last) = state.post_like_rate_limiter.get(&steamid) {
         if last.elapsed() < POST_LIKE_RATE_LIMIT {
+            let dur = started.elapsed().as_millis();
+            tracing::warn!(
+                "request user_id={} method={} url={} status=429 duration_ms={} like_requested={}",
+                steamid,
+                method.as_str(),
+                uri.to_string(),
+                dur,
+                requested
+            );
             return Err((
                 StatusCode::TOO_MANY_REQUESTS,
                 "You are liking too frequently.".into(),
@@ -474,11 +607,18 @@ async fn like_structure(
     }
     state.post_like_rate_limiter.insert(steamid, Instant::now());
 
-    let mut tx = state
-        .db
-        .begin()
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let mut tx = state.db.begin().await.map_err(|e| {
+        let dur = started.elapsed().as_millis();
+        tracing::error!(
+            "request user_id={} method={} url={} status=500 duration_ms={} like_requested={} error=tx_begin_failed",
+            steamid,
+            method.as_str(),
+            uri.to_string(),
+            dur,
+            requested
+        );
+        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+    })?;
 
     // Validate structure and get owner
     let owner: Option<(i64,)> =
@@ -487,32 +627,52 @@ async fn like_structure(
             .fetch_optional(&mut *tx)
             .await
             .map_err(|e| {
-                tracing::error!("like select owner failed: {}", e);
+                let dur = started.elapsed().as_millis();
+                tracing::error!(
+                    "request user_id={} method={} url={} status=500 duration_ms={} like_requested={} error=select_owner_failed",
+                    steamid,
+                    method.as_str(),
+                    uri.to_string(),
+                    dur,
+                    requested
+                );
                 (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
             })?;
+
     let Some((owner_user_id,)) = owner else {
         tx.rollback().await.ok();
+        let dur = started.elapsed().as_millis();
+        tracing::warn!(
+            "request user_id={} method={} url={} status=404 duration_ms={} like_requested={}",
+            steamid,
+            method.as_str(),
+            uri.to_string(),
+            dur,
+            requested
+        );
         return Err((StatusCode::NOT_FOUND, "Structure not found".into()));
     };
-    tracing::info!("like owner_user_id={}", owner_user_id);
 
     // Forbid self-like attempts
     if owner_user_id == steamid as i64 {
-        tracing::warn!(
-            "like denied: self-like attempt steamid={} structure_id={}",
-            steamid,
-            id
-        );
         tx.rollback().await.ok();
+        let dur = started.elapsed().as_millis();
+        tracing::warn!(
+            "request user_id={} method={} url={} status=400 duration_ms={} like_requested={} reason=self_like",
+            steamid,
+            method.as_str(),
+            uri.to_string(),
+            dur,
+            requested
+        );
         return Err((
             StatusCode::BAD_REQUEST,
             "Cannot like your own structure.".into(),
         ));
     }
 
-    // Normalize count
-    let count = body.count.unwrap_or(1).clamp(1, 100);
-    tracing::info!("like normalized_count={}", count);
+    // Normalize count AFTER logging requested
+    let count = requested.clamp(1, 100);
 
     // Ensure liker and owner exist in users
     sqlx::query(
@@ -523,7 +683,15 @@ async fn like_structure(
     .execute(&mut *tx)
     .await
     .map_err(|e| {
-        tracing::error!("like ensure liker failed: {}", e);
+        let dur = started.elapsed().as_millis();
+        tracing::error!(
+            "request user_id={} method={} url={} status=500 duration_ms={} like_requested={} error=ensure_liker_failed",
+            steamid,
+            method.as_str(),
+            uri.to_string(),
+            dur,
+            requested
+        );
         (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
     })?;
     sqlx::query(
@@ -534,7 +702,15 @@ async fn like_structure(
     .execute(&mut *tx)
     .await
     .map_err(|e| {
-        tracing::error!("like ensure owner failed: {}", e);
+        let dur = started.elapsed().as_millis();
+        tracing::error!(
+            "request user_id={} method={} url={} status=500 duration_ms={} like_requested={} error=ensure_owner_failed",
+            steamid,
+            method.as_str(),
+            uri.to_string(),
+            dur,
+            requested
+        );
         (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
     })?;
 
@@ -546,11 +722,28 @@ async fn like_structure(
             .execute(&mut *tx)
             .await
             .map_err(|e| {
-                tracing::error!("like update structure failed: {}", e);
+                let dur = started.elapsed().as_millis();
+                tracing::error!(
+                    "request user_id={} method={} url={} status=500 duration_ms={} like_requested={} error=update_structure_failed",
+                    steamid,
+                    method.as_str(),
+                    uri.to_string(),
+                    dur,
+                    requested
+                );
                 (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
             })?;
     if updated.rows_affected() == 0 {
         tx.rollback().await.ok();
+        let dur = started.elapsed().as_millis();
+        tracing::warn!(
+            "request user_id={} method={} url={} status=404 duration_ms={} like_requested={}",
+            steamid,
+            method.as_str(),
+            uri.to_string(),
+            dur,
+            requested
+        );
         return Err((StatusCode::NOT_FOUND, "Structure not found".into()));
     }
 
@@ -561,7 +754,15 @@ async fn like_structure(
         .execute(&mut *tx)
         .await
         .map_err(|e| {
-            tracing::error!("like update liker stats failed: {}", e);
+            let dur = started.elapsed().as_millis();
+            tracing::error!(
+                "request user_id={} method={} url={} status=500 duration_ms={} like_requested={} error=update_liker_metrics_failed",
+                steamid,
+                method.as_str(),
+                uri.to_string(),
+                dur,
+                requested
+            );
             (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
         })?;
     sqlx::query("UPDATE users SET likes_received = likes_received + ? WHERE user_id = ?")
@@ -570,29 +771,52 @@ async fn like_structure(
         .execute(&mut *tx)
         .await
         .map_err(|e| {
-            tracing::error!("like update owner stats failed: {}", e);
+            let dur = started.elapsed().as_millis();
+            tracing::error!(
+                "request user_id={} method={} url={} status=500 duration_ms={} like_requested={} error=update_owner_metrics_failed",
+                steamid,
+                method.as_str(),
+                uri.to_string(),
+                dur,
+                requested
+            );
             (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
         })?;
 
     tx.commit().await.map_err(|e| {
-        tracing::error!("like tx commit failed: {}", e);
+        let dur = started.elapsed().as_millis();
+        tracing::error!(
+            "request user_id={} method={} url={} status=500 duration_ms={} like_requested={} error=tx_commit_failed",
+            steamid,
+            method.as_str(),
+            uri.to_string(),
+            dur,
+            requested
+        );
         (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
     })?;
 
+    let dur = started.elapsed().as_millis();
     tracing::info!(
-        "POST like success steamid={} structure_id={} count={}",
+        "request user_id={} method={} url={} status=204 duration_ms={} like_requested={}",
         steamid,
-        id,
-        count
+        method.as_str(),
+        uri.to_string(),
+        dur,
+        requested
     );
+
     Ok(StatusCode::NO_CONTENT)
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::DEBUG)
-        .init();
+    // Only WARN/ERROR from deps, but INFO from this crate.
+    let crate_name = env!("CARGO_PKG_NAME");
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(format!("warn,{crate_name}=info")));
+
+    fmt().with_env_filter(filter).init();
 
     dotenv().ok();
 
@@ -607,7 +831,7 @@ async fn main() -> anyhow::Result<()> {
         .connect_with(connect_opts)
         .await?;
 
-    // one‑shot schema (extra NULL columns allowed)
+    // one-shot schema (extra NULL columns allowed)
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS structures (
@@ -653,7 +877,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/v1/structures", get(get_random))
         .route("/api/v1/structures", post(post_structure))
         .route("/api/v1/structures/{id}/like", post(like_structure))
-        .layer(TraceLayer::new_for_http())
+        // .layer(TraceLayer::new_for_http()) // intentionally removed to avoid extra logs
         .with_state(state.clone());
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();

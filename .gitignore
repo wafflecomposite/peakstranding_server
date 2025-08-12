@@ -1,4 +1,8 @@
 /target
-peakstranding.db
 .env
+peakstranding.db
 peakstranding_backup.db
+peakstranding.db-shm
+peakstranding.db-wal
+peakstranding2.db
+peakstranding_backup2.db
