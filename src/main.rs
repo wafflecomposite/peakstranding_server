@@ -511,10 +511,7 @@ async fn like_structure(
     }
 
     // Normalize count
-    let mut count = body.count.unwrap_or(1);
-    if count <= 0 {
-        count = 1;
-    }
+    let count = body.count.unwrap_or(1).clamp(1, 100);
     tracing::info!("like normalized_count={}", count);
 
     // Ensure liker and owner exist in users
