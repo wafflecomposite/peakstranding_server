@@ -35,6 +35,7 @@ struct Config {
     max_scene_length: usize,
     database_url: String,
     server_port: u16,
+    skip_steam_ticket_validation: bool,
 }
 
 impl Config {
@@ -72,6 +73,7 @@ impl Config {
             max_scene_length: parse_env("MAX_SCENE_LENGTH", 50_usize),
             database_url,
             server_port: parse_env("SERVER_PORT", 3000_u16),
+            skip_steam_ticket_validation: parse_env("SKIP_STEAM_TICKET_VALIDATION", false),
         }
     }
 }
@@ -116,6 +118,14 @@ impl FromRequestParts<AppState> for VerifiedUser {
             return Ok(VerifiedUser(*id));
         }
 
+
+        if state.config.skip_steam_ticket_validation {
+            let parsed_id = header
+                .parse::<u64>()
+                .map_err(|_| (StatusCode::BAD_REQUEST, "invalid steam ticket override".into()))?;
+            state.cache.insert(header, parsed_id);
+            return Ok(VerifiedUser(parsed_id));
+        }
         // Not cached – verify with Steam
         let url = format!(
             "https://api.steampowered.com/ISteamUserAuth/AuthenticateUserTicket/v1?key={}&appid={}&ticket={}",
@@ -868,6 +878,16 @@ async fn like_structure(
     Ok(StatusCode::NO_CONTENT)
 }
 
+
+fn build_router(state: AppState) -> Router {
+    Router::new()
+        .route("/api/v1/structures", get(get_random))
+        .route("/api/v1/structures", post(post_structure))
+        .route("/api/v1/structures/{id}/like", post(like_structure))
+        // .layer(TraceLayer::new_for_http()) // intentionally removed to avoid extra logs
+        .with_state(state)
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Only WARN/ERROR from deps, but INFO from this crate.
@@ -938,12 +958,7 @@ async fn main() -> anyhow::Result<()> {
         post_like_rate_limiter: Arc::new(DashMap::new()),
     };
 
-    let app = Router::new()
-        .route("/api/v1/structures", get(get_random))
-        .route("/api/v1/structures", post(post_structure))
-        .route("/api/v1/structures/{id}/like", post(like_structure))
-        // .layer(TraceLayer::new_for_http()) // intentionally removed to avoid extra logs
-        .with_state(state.clone());
+    let app = build_router(state.clone());
 
     let bind_addr = format!("0.0.0.0:{}", config.server_port);
     let listener = tokio::net::TcpListener::bind(&bind_addr).await.unwrap();
@@ -1023,3 +1038,5 @@ async fn column_exists(db: &SqlitePool, table: &str, column: &str) -> Result<boo
     Ok(false)
 }
 
+#[cfg(test)]
+mod tests;

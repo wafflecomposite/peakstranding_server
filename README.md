@@ -20,7 +20,7 @@ git clone https://github.com/wafflecomposite/peakstranding_server.git
 cd peakstranding_server
 cargo build --release        # use --verbose for more output
 ```
-The optimized binary is at target/release/peakstranding_server.  
+The optimized binary is at `target/release/peakstranding_server`.  
 For iterative development builds, run `cargo build`.  
 
 ## Configuration
@@ -30,15 +30,15 @@ The server reads configuration from environment variables (see the provided `.en
  STEAM_WEB_API_KEY=YOUR_KEY_HERE
 ```
 
-The following knobs are optional and fall back to sensible defaults:
+The following knobs are optional:
 
 - `STEAM_APPID` (default 3527290) – Steam AppID used when validating auth tickets.
 - `MAX_USER_STRUCTS_SAVED_PER_SCENE` (default 100) – Maximum stored structures per user/scene before pruning the oldest.
-- `MAX_REQUESTED_STRUCTS` (default 300) – Upper bound for a single random structures fetch.
+- `MAX_REQUESTED_STRUCTS` (default 400) – Upper bound for a single random structures fetch.
 - `POST_STRUCTURE_RATE_LIMIT` (default 2) – Seconds between structure submissions per user.
 - `GET_STRUCTURE_RATE_LIMIT` (default 6) – Seconds between random-structure reads per user.
 - `POST_LIKE_RATE_LIMIT` (default 1) – Seconds between like requests per user.
-- `DEFAULT_RANDOM_LIMIT` (default 30) – Default number of structures returned when a client omits `limit`.
+- `DEFAULT_RANDOM_LIMIT` (default 40) – Default number of structures returned when a client omits `limit`.
 - `MAX_SCENE_LENGTH` (default 50) – Maximum allowed characters for scene identifiers.
 - `DATABASE_URL` (default `sqlite://peakstranding.db?mode=rwc`) – SQLx connection string.
 - `SERVER_PORT` (default 3000) – TCP port the listener binds to.

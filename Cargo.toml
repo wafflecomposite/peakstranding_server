@@ -16,3 +16,7 @@ reqwest = { version = "0.12.23", features = ["json", "rustls-tls"] }
 dashmap = "6.1.0"
 tower = { version = "0.5.2", features = ["util"] }
 dotenvy = "0.15.7"
+
+[dev-dependencies]
+http-body-util = "0.1"
+serde_json = "1.0"
