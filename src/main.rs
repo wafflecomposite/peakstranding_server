@@ -12,16 +12,45 @@ use sqlx::{
     FromRow, Row, SqlitePool,
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous},
 };
-use std::{env, str::FromStr};
 use std::{
+    convert::TryFrom,
+    env,
+    str::FromStr,
     sync::{Arc, OnceLock},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use tokio::time::Instant;
+use tokio::{sync::RwLock, time::Instant};
 use tracing_subscriber::{EnvFilter, fmt};
 
 static STEAM_HEADER: HeaderName = HeaderName::from_static("x-steam-auth"); // Header for Steam auth ticket
 static CONFIG: OnceLock<Arc<Config>> = OnceLock::new();
+
+const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
+const MILLIS_IN_DAY: i64 = 86_400_000;
+
+#[derive(Debug, Clone)]
+struct CacheEntry<T> {
+    value: T,
+    expires_at: Instant,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct GlobalStatsResponse {
+    total_unique_players_all_time: i64,
+    total_structures_uploaded_all_time: i64,
+    total_likes_given_all_time: i64,
+    total_unique_players_last_24h: i64,
+    total_structures_uploaded_last_24h: i64,
+    server_version: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct UserStatsResponse {
+    total_structures_uploaded: i64,
+    structures_uploaded_last_24h: i64,
+    total_likes_received: i64,
+    total_likes_sent: i64,
+}
 
 #[derive(Debug, Clone)]
 struct Config {
@@ -31,6 +60,9 @@ struct Config {
     post_structure_rate_limit: Duration,
     get_structure_rate_limit: Duration,
     post_like_rate_limit: Duration,
+    global_stats_rate_limit: Duration,
+    user_stats_rate_limit: Duration,
+    global_stats_cache_ttl: Duration,
     default_random_limit: i64,
     max_scene_length: usize,
     database_url: String,
@@ -69,6 +101,15 @@ impl Config {
                 6_u64,
             )),
             post_like_rate_limit: Duration::from_secs(parse_env("POST_LIKE_RATE_LIMIT", 1_u64)),
+            global_stats_rate_limit: Duration::from_secs(parse_env(
+                "GLOBAL_STATS_RATE_LIMIT",
+                6_u64,
+            )),
+            user_stats_rate_limit: Duration::from_secs(parse_env("USER_STATS_RATE_LIMIT", 6_u64)),
+            global_stats_cache_ttl: Duration::from_secs(parse_env(
+                "GLOBAL_STATS_CACHE_TTL_SECONDS",
+                600_u64,
+            )),
             default_random_limit: parse_env("DEFAULT_RANDOM_LIMIT", 40_i64),
             max_scene_length: parse_env("MAX_SCENE_LENGTH", 50_usize),
             database_url,
@@ -96,6 +137,9 @@ struct AppState {
     post_structure_rate_limiter: Arc<DashMap<u64, Instant>>,
     get_structure_rate_limiter: Arc<DashMap<u64, Instant>>,
     post_like_rate_limiter: Arc<DashMap<u64, Instant>>,
+    global_stats_rate_limiter: Arc<DashMap<u64, Instant>>,
+    user_stats_rate_limiter: Arc<DashMap<u64, Instant>>,
+    global_stats_cache: Arc<RwLock<Option<CacheEntry<GlobalStatsResponse>>>>,
 }
 
 //#[async_trait] // not needed for axum 0.7's FromRequestParts
@@ -118,11 +162,13 @@ impl FromRequestParts<AppState> for VerifiedUser {
             return Ok(VerifiedUser(*id));
         }
 
-
         if state.config.skip_steam_ticket_validation {
-            let parsed_id = header
-                .parse::<u64>()
-                .map_err(|_| (StatusCode::BAD_REQUEST, "invalid steam ticket override".into()))?;
+            let parsed_id = header.parse::<u64>().map_err(|_| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    "invalid steam ticket override".into(),
+                )
+            })?;
             state.cache.insert(header, parsed_id);
             return Ok(VerifiedUser(parsed_id));
         }
@@ -640,6 +686,265 @@ async fn get_random(
     Ok(Json(rows))
 }
 
+async fn get_global_stats(
+    State(state): State<AppState>,
+    VerifiedUser(steamid): VerifiedUser,
+    OriginalUri(uri): OriginalUri,
+    method: Method,
+) -> Result<Json<GlobalStatsResponse>, (StatusCode, String)> {
+    let started = Instant::now();
+
+    if let Some(last) = state.global_stats_rate_limiter.get(&steamid) {
+        if last.elapsed() < state.config.global_stats_rate_limit {
+            let dur = started.elapsed().as_millis();
+            tracing::warn!(
+                "request user_id={} method={} url={} status=429 duration_ms={}",
+                steamid,
+                method.as_str(),
+                uri.to_string(),
+                dur
+            );
+            return Err((
+                StatusCode::TOO_MANY_REQUESTS,
+                "You are requesting stats too frequently.".into(),
+            ));
+        }
+    }
+    state
+        .global_stats_rate_limiter
+        .insert(steamid, Instant::now());
+
+    let cache_now = Instant::now();
+    if let Some(cached) = {
+        let guard = state.global_stats_cache.read().await;
+        guard
+            .as_ref()
+            .filter(|entry| entry.expires_at > cache_now)
+            .map(|entry| entry.value.clone())
+    } {
+        let dur = started.elapsed().as_millis();
+        tracing::info!(
+            "request user_id={} method={} url={} status=200 duration_ms={} cache_hit=true",
+            steamid,
+            method.as_str(),
+            uri.to_string(),
+            dur
+        );
+        return Ok(Json(cached));
+    }
+
+    let now_duration = SystemTime::now().duration_since(UNIX_EPOCH).map_err(|_| {
+        let dur = started.elapsed().as_millis();
+        tracing::error!(
+            "request user_id={} method={} url={} status=500 duration_ms={} error=system_time_error",
+            steamid,
+            method.as_str(),
+            uri.to_string(),
+            dur
+        );
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "System clock error".into(),
+        )
+    })?;
+    let now_ms = i64::try_from(now_duration.as_millis()).map_err(|_| {
+        let dur = started.elapsed().as_millis();
+        tracing::error!(
+            "request user_id={} method={} url={} status=500 duration_ms={} error=system_time_overflow",
+            steamid,
+            method.as_str(),
+            uri.to_string(),
+            dur
+        );
+        (StatusCode::INTERNAL_SERVER_ERROR, "System clock overflow".into())
+    })?;
+    let since_ms = now_ms.saturating_sub(MILLIS_IN_DAY);
+
+    let stats_row = sqlx::query_as::<_, (i64, i64, i64, i64, i64)>(
+        r#"
+        SELECT
+            (SELECT COUNT(DISTINCT user_id) FROM structures WHERE deleted = 0) AS total_unique_players_all_time,
+            (SELECT COUNT(*) FROM structures WHERE deleted = 0) AS total_structures_uploaded_all_time,
+            (SELECT COALESCE(SUM(likes_send), 0) FROM users) AS total_likes_given_all_time,
+            (SELECT COUNT(DISTINCT user_id) FROM structures WHERE deleted = 0 AND created_at >= ?) AS total_unique_players_last_24h,
+            (SELECT COUNT(*) FROM structures WHERE deleted = 0 AND created_at >= ?) AS total_structures_uploaded_last_24h
+        "#,
+    )
+    .bind(since_ms)
+    .bind(since_ms)
+    .fetch_one(&state.db)
+    .await
+    .map_err(|e| {
+        let dur = started.elapsed().as_millis();
+        tracing::error!(
+            "request user_id={} method={} url={} status=500 duration_ms={} error=global_stats_query_failed",
+            steamid,
+            method.as_str(),
+            uri.to_string(),
+            dur
+        );
+        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+    })?;
+
+    let stats = GlobalStatsResponse {
+        total_unique_players_all_time: stats_row.0,
+        total_structures_uploaded_all_time: stats_row.1,
+        total_likes_given_all_time: stats_row.2,
+        total_unique_players_last_24h: stats_row.3,
+        total_structures_uploaded_last_24h: stats_row.4,
+        server_version: SERVER_VERSION.to_string(),
+    };
+
+    {
+        let mut cache = state.global_stats_cache.write().await;
+        *cache = Some(CacheEntry {
+            value: stats.clone(),
+            expires_at: Instant::now() + state.config.global_stats_cache_ttl,
+        });
+    }
+
+    let dur = started.elapsed().as_millis();
+    tracing::info!(
+        "request user_id={} method={} url={} status=200 duration_ms={} cache_hit=false",
+        steamid,
+        method.as_str(),
+        uri.to_string(),
+        dur
+    );
+
+    Ok(Json(stats))
+}
+
+async fn get_user_stats(
+    State(state): State<AppState>,
+    VerifiedUser(steamid): VerifiedUser,
+    OriginalUri(uri): OriginalUri,
+    method: Method,
+) -> Result<Json<UserStatsResponse>, (StatusCode, String)> {
+    let started = Instant::now();
+
+    if let Some(last) = state.user_stats_rate_limiter.get(&steamid) {
+        if last.elapsed() < state.config.user_stats_rate_limit {
+            let dur = started.elapsed().as_millis();
+            tracing::warn!(
+                "request user_id={} method={} url={} status=429 duration_ms={}",
+                steamid,
+                method.as_str(),
+                uri.to_string(),
+                dur
+            );
+            return Err((
+                StatusCode::TOO_MANY_REQUESTS,
+                "You are requesting stats too frequently.".into(),
+            ));
+        }
+    }
+    state
+        .user_stats_rate_limiter
+        .insert(steamid, Instant::now());
+
+    let now_duration = SystemTime::now().duration_since(UNIX_EPOCH).map_err(|_| {
+        let dur = started.elapsed().as_millis();
+        tracing::error!(
+            "request user_id={} method={} url={} status=500 duration_ms={} error=system_time_error",
+            steamid,
+            method.as_str(),
+            uri.to_string(),
+            dur
+        );
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "System clock error".into(),
+        )
+    })?;
+    let now_ms = i64::try_from(now_duration.as_millis()).map_err(|_| {
+        let dur = started.elapsed().as_millis();
+        tracing::error!(
+            "request user_id={} method={} url={} status=500 duration_ms={} error=system_time_overflow",
+            steamid,
+            method.as_str(),
+            uri.to_string(),
+            dur
+        );
+        (StatusCode::INTERNAL_SERVER_ERROR, "System clock overflow".into())
+    })?;
+    let since_ms = now_ms.saturating_sub(MILLIS_IN_DAY);
+
+    let total_structures_uploaded = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM structures WHERE user_id = ? AND deleted = 0",
+    )
+    .bind(steamid as i64)
+    .fetch_one(&state.db)
+    .await
+    .map_err(|e| {
+        let dur = started.elapsed().as_millis();
+        tracing::error!(
+            "request user_id={} method={} url={} status=500 duration_ms={} error=user_stats_total_structures_failed",
+            steamid,
+            method.as_str(),
+            uri.to_string(),
+            dur
+        );
+        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+    })?;
+
+    let structures_uploaded_last_24h = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM structures WHERE user_id = ? AND deleted = 0 AND created_at >= ?",
+    )
+    .bind(steamid as i64)
+    .bind(since_ms)
+    .fetch_one(&state.db)
+    .await
+    .map_err(|e| {
+        let dur = started.elapsed().as_millis();
+        tracing::error!(
+            "request user_id={} method={} url={} status=500 duration_ms={} error=user_stats_recent_structures_failed",
+            steamid,
+            method.as_str(),
+            uri.to_string(),
+            dur
+        );
+        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+    })?;
+
+    let likes = sqlx::query_as::<_, (i64, i64)>(
+        "SELECT likes_received, likes_send FROM users WHERE user_id = ?",
+    )
+    .bind(steamid as i64)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| {
+        let dur = started.elapsed().as_millis();
+        tracing::error!(
+            "request user_id={} method={} url={} status=500 duration_ms={} error=user_stats_likes_failed",
+            steamid,
+            method.as_str(),
+            uri.to_string(),
+            dur
+        );
+        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+    })?;
+    let (total_likes_received, total_likes_sent) = likes.unwrap_or((0, 0));
+
+    let stats = UserStatsResponse {
+        total_structures_uploaded,
+        structures_uploaded_last_24h,
+        total_likes_received,
+        total_likes_sent,
+    };
+
+    let dur = started.elapsed().as_millis();
+    tracing::info!(
+        "request user_id={} method={} url={} status=200 duration_ms={}",
+        steamid,
+        method.as_str(),
+        uri.to_string(),
+        dur
+    );
+
+    Ok(Json(stats))
+}
+
 #[derive(Deserialize)]
 struct LikeBody {
     count: Option<i32>,
@@ -878,12 +1183,13 @@ async fn like_structure(
     Ok(StatusCode::NO_CONTENT)
 }
 
-
 fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/api/v1/structures", get(get_random))
         .route("/api/v1/structures", post(post_structure))
         .route("/api/v1/structures/{id}/like", post(like_structure))
+        .route("/api/v1/stats/global", get(get_global_stats))
+        .route("/api/v1/stats/me", get(get_user_stats))
         // .layer(TraceLayer::new_for_http()) // intentionally removed to avoid extra logs
         .with_state(state)
 }
@@ -956,6 +1262,9 @@ async fn main() -> anyhow::Result<()> {
         post_structure_rate_limiter: Arc::new(DashMap::new()),
         get_structure_rate_limiter: Arc::new(DashMap::new()),
         post_like_rate_limiter: Arc::new(DashMap::new()),
+        global_stats_rate_limiter: Arc::new(DashMap::new()),
+        user_stats_rate_limiter: Arc::new(DashMap::new()),
+        global_stats_cache: Arc::new(RwLock::new(None)),
     };
 
     let app = build_router(state.clone());

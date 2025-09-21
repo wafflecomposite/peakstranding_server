@@ -5,9 +5,10 @@ use axum::{
     body::Body,
     http::{Method, Request, StatusCode},
 };
-use serde_json::{json, Value};
-use std::sync::Arc;
 use http_body_util::BodyExt;
+use serde_json::{Value, json};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tower::ServiceExt;
 
 const OWNER_TICKET: &str = "owner-ticket";
@@ -61,7 +62,9 @@ impl TestContext {
             .execute(&pool)
             .await
             .expect("failed to run ddl");
-        apply_migrations(&pool).await.expect("failed to run migrations");
+        apply_migrations(&pool)
+            .await
+            .expect("failed to run migrations");
 
         let cache = Arc::new(DashMap::new());
         cache.insert(OWNER_TICKET.to_string(), OWNER_ID);
@@ -77,6 +80,9 @@ impl TestContext {
             post_structure_rate_limiter: Arc::new(DashMap::new()),
             get_structure_rate_limiter: Arc::new(DashMap::new()),
             post_like_rate_limiter: Arc::new(DashMap::new()),
+            global_stats_rate_limiter: Arc::new(DashMap::new()),
+            user_stats_rate_limiter: Arc::new(DashMap::new()),
+            global_stats_cache: Arc::new(RwLock::new(None)),
         };
 
         let app = build_router(state.clone());
@@ -116,7 +122,12 @@ impl TestContext {
             .expect("GET /structures request failed")
     }
 
-    async fn like_structure(&self, ticket: &str, id: i64, body: Value) -> axum::http::Response<Body> {
+    async fn like_structure(
+        &self,
+        ticket: &str,
+        id: i64,
+        body: Value,
+    ) -> axum::http::Response<Body> {
         let uri = format!("/api/v1/structures/{id}/like");
         self.app
             .clone()
@@ -133,6 +144,36 @@ impl TestContext {
             .expect("POST /like request failed")
     }
 
+    async fn get_global_stats(&self, ticket: &str) -> axum::http::Response<Body> {
+        self.app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/v1/stats/global")
+                    .header(&STEAM_HEADER, ticket)
+                    .body(Body::empty())
+                    .expect("failed to build global stats request"),
+            )
+            .await
+            .expect("GET /stats/global request failed")
+    }
+
+    async fn get_user_stats(&self, ticket: &str) -> axum::http::Response<Body> {
+        self.app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/v1/stats/me")
+                    .header(&STEAM_HEADER, ticket)
+                    .body(Body::empty())
+                    .expect("failed to build user stats request"),
+            )
+            .await
+            .expect("GET /stats/me request failed")
+    }
+
     fn clear_post_rate_limit(&self, steam_id: u64) {
         self.state.post_structure_rate_limiter.remove(&steam_id);
     }
@@ -141,6 +182,9 @@ impl TestContext {
         self.state.get_structure_rate_limiter.remove(&steam_id);
     }
 
+    fn clear_global_stats_rate_limit(&self, steam_id: u64) {
+        self.state.global_stats_rate_limiter.remove(&steam_id);
+    }
 }
 
 fn shared_test_config() -> Arc<Config> {
@@ -153,6 +197,9 @@ fn shared_test_config() -> Arc<Config> {
                 post_structure_rate_limit: Duration::from_millis(100),
                 get_structure_rate_limit: Duration::from_millis(100),
                 post_like_rate_limit: Duration::from_millis(100),
+                global_stats_rate_limit: Duration::from_millis(100),
+                user_stats_rate_limit: Duration::from_millis(100),
+                global_stats_cache_ttl: Duration::from_secs(600),
                 default_random_limit: 3,
                 max_scene_length: 16,
                 database_url: "sqlite::memory:".to_string(),
@@ -163,7 +210,13 @@ fn shared_test_config() -> Arc<Config> {
         .clone()
 }
 
-fn structure_payload(username: &str, scene: &str, map_id: i32, segment: i32, prefab: &str) -> Value {
+fn structure_payload(
+    username: &str,
+    scene: &str,
+    map_id: i32,
+    segment: i32,
+    prefab: &str,
+) -> Value {
     json!({
         "username": username,
         "map_id": map_id,
@@ -269,14 +322,16 @@ async fn post_structure_prunes_oldest_per_user_scene() {
         )
         .await;
     }
-    let prefabs: Vec<String> = sqlx::query_scalar(
-        "SELECT prefab FROM structures WHERE scene = ? ORDER BY id",
-    )
-    .bind("ScenePrune")
-    .fetch_all(&ctx.state.db)
-    .await
-    .unwrap();
-    assert_eq!(prefabs, vec!["prefab_1".to_string(), "prefab_2".to_string()]);
+    let prefabs: Vec<String> =
+        sqlx::query_scalar("SELECT prefab FROM structures WHERE scene = ? ORDER BY id")
+            .bind("ScenePrune")
+            .fetch_all(&ctx.state.db)
+            .await
+            .unwrap();
+    assert_eq!(
+        prefabs,
+        vec!["prefab_1".to_string(), "prefab_2".to_string()]
+    );
 }
 
 #[tokio::test]
@@ -397,6 +452,188 @@ async fn get_random_enforces_rate_limit() {
 }
 
 #[tokio::test]
+async fn global_stats_returns_values_and_uses_cache() {
+    let ctx = TestContext::new().await;
+    let _owner_structure = create_structure(
+        &ctx,
+        OWNER_TICKET,
+        OWNER_ID,
+        "OwnerStats",
+        "SceneStats",
+        1,
+        0,
+        "prefab_owner_stats",
+    )
+    .await;
+    let _liker_structure = create_structure(
+        &ctx,
+        LIKER_TICKET,
+        LIKER_ID,
+        "LikerStats",
+        "SceneStats",
+        1,
+        1,
+        "prefab_liker_stats",
+    )
+    .await;
+    let other_structure = create_structure(
+        &ctx,
+        OTHER_TICKET,
+        OTHER_ID,
+        "OtherStats",
+        "SceneStats",
+        1,
+        2,
+        "prefab_other_stats",
+    )
+    .await;
+
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock should be valid")
+        .as_millis() as i64;
+    let old_ms = now_ms - (2 * MILLIS_IN_DAY);
+    sqlx::query("UPDATE structures SET created_at = ? WHERE id = ?")
+        .bind(old_ms)
+        .bind(other_structure)
+        .execute(&ctx.state.db)
+        .await
+        .unwrap();
+
+    for (user_id, likes_send, likes_received) in [
+        (OWNER_ID, 2_i64, 9_i64),
+        (LIKER_ID, 5_i64, 3_i64),
+        (OTHER_ID, 10_i64, 1_i64),
+    ] {
+        sqlx::query("UPDATE users SET likes_send = ?, likes_received = ? WHERE user_id = ?")
+            .bind(likes_send)
+            .bind(likes_received)
+            .bind(user_id as i64)
+            .execute(&ctx.state.db)
+            .await
+            .unwrap();
+    }
+
+    let response = ctx.get_global_stats(OWNER_TICKET).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await;
+
+    assert_eq!(body["total_unique_players_all_time"].as_i64().unwrap(), 3);
+    assert_eq!(
+        body["total_structures_uploaded_all_time"].as_i64().unwrap(),
+        3
+    );
+    assert_eq!(body["total_likes_given_all_time"].as_i64().unwrap(), 17);
+    assert_eq!(body["total_unique_players_last_24h"].as_i64().unwrap(), 2);
+    assert_eq!(
+        body["total_structures_uploaded_last_24h"].as_i64().unwrap(),
+        2
+    );
+    assert_eq!(
+        body["server_version"].as_str().unwrap(),
+        env!("CARGO_PKG_VERSION")
+    );
+
+    let _ = create_structure(
+        &ctx,
+        OTHER_TICKET,
+        OTHER_ID,
+        "OtherStats",
+        "SceneStats",
+        1,
+        3,
+        "prefab_other_stats_2",
+    )
+    .await;
+
+    sqlx::query("UPDATE users SET likes_send = likes_send + 1 WHERE user_id = ?")
+        .bind(OTHER_ID as i64)
+        .execute(&ctx.state.db)
+        .await
+        .unwrap();
+
+    ctx.clear_global_stats_rate_limit(OWNER_ID);
+    let cached_response = ctx.get_global_stats(OWNER_TICKET).await;
+    assert_eq!(cached_response.status(), StatusCode::OK);
+    let cached_body = response_json(cached_response).await;
+    assert_eq!(cached_body, body);
+}
+
+#[tokio::test]
+async fn global_stats_enforces_rate_limit() {
+    let ctx = TestContext::new().await;
+    let first = ctx.get_global_stats(OWNER_TICKET).await;
+    assert_eq!(first.status(), StatusCode::OK);
+    let second = ctx.get_global_stats(OWNER_TICKET).await;
+    assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn user_stats_returns_values() {
+    let ctx = TestContext::new().await;
+    let first = create_structure(
+        &ctx,
+        OWNER_TICKET,
+        OWNER_ID,
+        "OwnerUser",
+        "SceneUserStats",
+        1,
+        0,
+        "prefab_user_a",
+    )
+    .await;
+    let _second = create_structure(
+        &ctx,
+        OWNER_TICKET,
+        OWNER_ID,
+        "OwnerUser",
+        "SceneUserStats",
+        1,
+        1,
+        "prefab_user_b",
+    )
+    .await;
+
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock should be valid")
+        .as_millis() as i64;
+    let old_ms = now_ms - (2 * MILLIS_IN_DAY);
+    sqlx::query("UPDATE structures SET created_at = ? WHERE id = ?")
+        .bind(old_ms)
+        .bind(first)
+        .execute(&ctx.state.db)
+        .await
+        .unwrap();
+
+    sqlx::query("UPDATE users SET likes_received = ?, likes_send = ? WHERE user_id = ?")
+        .bind(9_i64)
+        .bind(4_i64)
+        .bind(OWNER_ID as i64)
+        .execute(&ctx.state.db)
+        .await
+        .unwrap();
+
+    let response = ctx.get_user_stats(OWNER_TICKET).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await;
+
+    assert_eq!(body["total_structures_uploaded"].as_i64().unwrap(), 2);
+    assert_eq!(body["structures_uploaded_last_24h"].as_i64().unwrap(), 1);
+    assert_eq!(body["total_likes_received"].as_i64().unwrap(), 9);
+    assert_eq!(body["total_likes_sent"].as_i64().unwrap(), 4);
+}
+
+#[tokio::test]
+async fn user_stats_enforces_rate_limit() {
+    let ctx = TestContext::new().await;
+    let first = ctx.get_user_stats(OWNER_TICKET).await;
+    assert_eq!(first.status(), StatusCode::OK);
+    let second = ctx.get_user_stats(OWNER_TICKET).await;
+    assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
 async fn like_structure_updates_counts_and_clamps() {
     let ctx = TestContext::new().await;
     let structure_id = create_structure(
@@ -423,22 +660,20 @@ async fn like_structure_updates_counts_and_clamps() {
         .unwrap();
     assert_eq!(likes, 100);
 
-    let (likes_send,) = sqlx::query_as::<_, (i64,)>(
-        "SELECT likes_send FROM users WHERE user_id = ?",
-    )
-    .bind(LIKER_ID as i64)
-    .fetch_one(&ctx.state.db)
-    .await
-    .unwrap();
+    let (likes_send,) =
+        sqlx::query_as::<_, (i64,)>("SELECT likes_send FROM users WHERE user_id = ?")
+            .bind(LIKER_ID as i64)
+            .fetch_one(&ctx.state.db)
+            .await
+            .unwrap();
     assert_eq!(likes_send, 100);
 
-    let (likes_received,) = sqlx::query_as::<_, (i64,)>(
-        "SELECT likes_received FROM users WHERE user_id = ?",
-    )
-    .bind(OWNER_ID as i64)
-    .fetch_one(&ctx.state.db)
-    .await
-    .unwrap();
+    let (likes_received,) =
+        sqlx::query_as::<_, (i64,)>("SELECT likes_received FROM users WHERE user_id = ?")
+            .bind(OWNER_ID as i64)
+            .fetch_one(&ctx.state.db)
+            .await
+            .unwrap();
     assert_eq!(likes_received, 100);
 }
 
@@ -496,4 +731,3 @@ async fn like_structure_fails_for_missing_structure() {
         .await;
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
-
