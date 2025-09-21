@@ -13,28 +13,84 @@ use sqlx::{
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous},
 };
 use std::{env, str::FromStr};
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
 use tokio::time::Instant;
-// Removed TraceLayer so we only emit our own compact logs
-// use tower_http::trace::TraceLayer;
 use tracing_subscriber::{EnvFilter, fmt};
 
 static STEAM_HEADER: HeaderName = HeaderName::from_static("x-steam-auth"); // Header for Steam auth ticket
-static STEAM_APPID: u64 = 3527290; // Peak Stranding AppID
-const MAX_USER_STRUCTS_SAVED_PER_SCENE: i64 = 100;
-const MAX_REQUESTED_STRUCTS: i64 = 300;
+static CONFIG: OnceLock<Arc<Config>> = OnceLock::new();
 
-static POST_STRUCTURE_RATE_LIMIT: Duration = Duration::from_secs(2);
-static GET_STRUCTURE_RATE_LIMIT: Duration = Duration::from_secs(6);
-static POST_LIKE_RATE_LIMIT: Duration = Duration::from_secs(1);
+#[derive(Debug, Clone)]
+struct Config {
+    steam_appid: u64,
+    max_user_structs_saved_per_scene: i64,
+    max_requested_structs: i64,
+    post_structure_rate_limit: Duration,
+    get_structure_rate_limit: Duration,
+    post_like_rate_limit: Duration,
+    default_random_limit: i64,
+    max_scene_length: usize,
+    database_url: String,
+    server_port: u16,
+}
+
+impl Config {
+    fn from_env() -> Self {
+        fn parse_env<T>(key: &str, default: T) -> T
+        where
+            T: FromStr,
+        {
+            env::var(key)
+                .ok()
+                .and_then(|value| value.parse::<T>().ok())
+                .unwrap_or(default)
+        }
+
+        let database_url = env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "sqlite://peakstranding.db?mode=rwc".to_string());
+
+        Self {
+            steam_appid: parse_env("STEAM_APPID", 3527290_u64),
+            max_user_structs_saved_per_scene: parse_env(
+                "MAX_USER_STRUCTS_SAVED_PER_SCENE",
+                100_i64,
+            ),
+            max_requested_structs: parse_env("MAX_REQUESTED_STRUCTS", 400_i64),
+            post_structure_rate_limit: Duration::from_secs(parse_env(
+                "POST_STRUCTURE_RATE_LIMIT",
+                2_u64,
+            )),
+            get_structure_rate_limit: Duration::from_secs(parse_env(
+                "GET_STRUCTURE_RATE_LIMIT",
+                6_u64,
+            )),
+            post_like_rate_limit: Duration::from_secs(parse_env("POST_LIKE_RATE_LIMIT", 1_u64)),
+            default_random_limit: parse_env("DEFAULT_RANDOM_LIMIT", 40_i64),
+            max_scene_length: parse_env("MAX_SCENE_LENGTH", 50_usize),
+            database_url,
+            server_port: parse_env("SERVER_PORT", 3000_u16),
+        }
+    }
+}
+
+fn config() -> &'static Config {
+    CONFIG
+        .get()
+        .map(|cfg| cfg.as_ref())
+        .expect("Config not initialized")
+}
 struct VerifiedUser(u64); // steam_id
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 struct AppState {
     db: SqlitePool,
     cache: Arc<DashMap<String, u64>>,
     http: Client,
     steam_key: String,
+    config: Arc<Config>,
     post_structure_rate_limiter: Arc<DashMap<u64, Instant>>,
     get_structure_rate_limiter: Arc<DashMap<u64, Instant>>,
     post_like_rate_limiter: Arc<DashMap<u64, Instant>>,
@@ -63,7 +119,7 @@ impl FromRequestParts<AppState> for VerifiedUser {
         // Not cached – verify with Steam
         let url = format!(
             "https://api.steampowered.com/ISteamUserAuth/AuthenticateUserTicket/v1?key={}&appid={}&ticket={}",
-            state.steam_key, STEAM_APPID, header
+            state.steam_key, state.config.steam_appid, header
         );
 
         #[derive(Deserialize)]
@@ -255,9 +311,9 @@ async fn post_structure(
 ) -> Result<Json<Structure>, (StatusCode, String)> {
     let started = Instant::now();
 
-    // Rate limiting check for posting structures (2 seconds)
+    // Rate limiting check for posting structures (configurable)
     if let Some(last_post_time) = state.post_structure_rate_limiter.get(&steamid) {
-        if last_post_time.elapsed() < POST_STRUCTURE_RATE_LIMIT {
+        if last_post_time.elapsed() < state.config.post_structure_rate_limit {
             let dur = started.elapsed().as_millis();
             let url = uri.to_string();
             tracing::warn!(
@@ -384,7 +440,7 @@ async fn post_structure(
             })?;
 
     // 3. If over the limit, delete the oldest one.
-    if count > MAX_USER_STRUCTS_SAVED_PER_SCENE {
+    if count > state.config.max_user_structs_saved_per_scene {
         let delete_query = r#"
             DELETE FROM structures
             WHERE id = (
@@ -438,7 +494,7 @@ struct RandomParams {
     exclude_prefabs: Option<String>,
 }
 fn default_limit() -> i64 {
-    30
+    config().default_random_limit
 }
 
 async fn get_random(
@@ -451,7 +507,7 @@ async fn get_random(
     let started = Instant::now();
 
     if let Some(last_get_time) = state.get_structure_rate_limiter.get(&steamid) {
-        if last_get_time.elapsed() < GET_STRUCTURE_RATE_LIMIT {
+        if last_get_time.elapsed() < state.config.get_structure_rate_limit {
             let dur = started.elapsed().as_millis();
             tracing::warn!(
                 "request user_id={} method={} url={} status=429 duration_ms={}",
@@ -470,7 +526,7 @@ async fn get_random(
         .get_structure_rate_limiter
         .insert(steamid, Instant::now());
 
-    if p.scene.len() > 50 {
+    if p.scene.len() > state.config.max_scene_length {
         let dur = started.elapsed().as_millis();
         tracing::warn!(
             "request user_id={} method={} url={} status=400 duration_ms={} reason=scene_too_long",
@@ -481,10 +537,13 @@ async fn get_random(
         );
         return Err((
             StatusCode::BAD_REQUEST,
-            "scene must be ≤ 50 characters".into(),
+            format!(
+                "scene must be <= {} characters",
+                state.config.max_scene_length
+            ),
         ));
     }
-    let limit = p.limit.clamp(0, MAX_REQUESTED_STRUCTS);
+    let limit = p.limit.clamp(0, state.config.max_requested_structs);
 
     let base_query = r#"
         WITH RankedStructures AS (
@@ -587,9 +646,9 @@ async fn like_structure(
     let started = Instant::now();
     let requested = body.count.unwrap_or(1); // log before clamp
 
-    // Per-user rate limit for likes (1s)
+    // Per-user rate limit for likes (configurable)
     if let Some(last) = state.post_like_rate_limiter.get(&steamid) {
-        if last.elapsed() < POST_LIKE_RATE_LIMIT {
+        if last.elapsed() < state.config.post_like_rate_limit {
             let dur = started.elapsed().as_millis();
             tracing::warn!(
                 "request user_id={} method={} url={} status=429 duration_ms={} like_requested={}",
@@ -820,7 +879,12 @@ async fn main() -> anyhow::Result<()> {
 
     dotenv().ok();
 
-    let connect_opts = SqliteConnectOptions::from_str("sqlite://peakstranding.db?mode=rwc")?
+    let config = Arc::new(Config::from_env());
+    CONFIG
+        .set(config.clone())
+        .expect("Config already initialized");
+
+    let connect_opts = SqliteConnectOptions::from_str(&config.database_url)?
         .journal_mode(SqliteJournalMode::Wal)
         .synchronous(SqliteSynchronous::Normal)
         .busy_timeout(std::time::Duration::from_secs(5));
@@ -831,15 +895,14 @@ async fn main() -> anyhow::Result<()> {
         .connect_with(connect_opts)
         .await?;
 
-    // one-shot schema (extra NULL columns allowed)
-    sqlx::query(
+    let structures_ddl = format!(
         r#"
         CREATE TABLE IF NOT EXISTS structures (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             username  TEXT CHECK (length(username) <= 50),
             user_id   INTEGER NOT NULL,
             map_id    INTEGER NOT NULL,
-            scene     TEXT NOT NULL CHECK (length(scene) <= 50),
+            scene     TEXT NOT NULL CHECK (length(scene) <= {max_scene_length}),
             segment   INTEGER,
             prefab    TEXT NOT NULL CHECK (length(prefab) <= 50),
             pos_x REAL, pos_y REAL, pos_z REAL,
@@ -853,9 +916,10 @@ async fn main() -> anyhow::Result<()> {
             created_at INTEGER NOT NULL
         );
         "#,
-    )
-    .execute(&db)
-    .await?;
+        max_scene_length = config.max_scene_length
+    );
+
+    sqlx::query(&structures_ddl).execute(&db).await?;
 
     // apply non-destructive migrations if needed
     apply_migrations(&db).await?;
@@ -868,6 +932,7 @@ async fn main() -> anyhow::Result<()> {
             .timeout(Duration::from_secs(5))
             .build()?,
         steam_key: env::var("STEAM_WEB_API_KEY").expect("STEAM_WEB_API_KEY missing"),
+        config: config.clone(),
         post_structure_rate_limiter: Arc::new(DashMap::new()),
         get_structure_rate_limiter: Arc::new(DashMap::new()),
         post_like_rate_limiter: Arc::new(DashMap::new()),
@@ -880,8 +945,9 @@ async fn main() -> anyhow::Result<()> {
         // .layer(TraceLayer::new_for_http()) // intentionally removed to avoid extra logs
         .with_state(state.clone());
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
-    tracing::info!("Server listening on {:?}", listener);
+    let bind_addr = format!("0.0.0.0:{}", config.server_port);
+    let listener = tokio::net::TcpListener::bind(&bind_addr).await.unwrap();
+    tracing::info!("Server listening on {}", bind_addr);
     axum::serve(listener, app).await.unwrap();
 
     Ok(())
@@ -956,3 +1022,4 @@ async fn column_exists(db: &SqlitePool, table: &str, column: &str) -> Result<boo
     }
     Ok(false)
 }
+
